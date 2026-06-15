@@ -45,6 +45,8 @@ def normalize_person_name(value) -> str:
     return " ".join("".join(cleaned_chars).split())
 
 
+HEADSHOT_DEBUG = []
+
 def normalize_identifier(value) -> str:
     """Normalize ID values like 807842, 807842.0, or ' 807842 '."""
     if pd.isna(value):
@@ -88,14 +90,108 @@ def possible_name_columns(columns: List[str]) -> List[str]:
 
 
 
-def get_auto_headshot_bytes(id_keys) -> Optional[bytes]:
-    """Fetch a player headshot using MLB/MiLBAM playerId.
+def slugify_player_name_for_milb(name: str) -> str:
+    """Build the MiLB/MLB player-page slug: firstname-lastname-playerid."""
+    if not name:
+        return ""
+    import unicodedata
+    text = str(name).strip()
+    # Remove common CSV artifacts before slugifying.
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text
 
-    The app tries MLB's public image service first, which is also used for
-    MiLB player pages when the playerId is a MiLB/MLBAM id. If the image
-    service is unavailable or the ID has no photo, return None so the user can
-    continue or upload a photo manually.
+
+def _normalize_image_bytes_for_reportlab(data: bytes) -> Optional[bytes]:
+    """Return JPEG/PNG bytes that ReportLab can reliably draw.
+
+    MLB/MiLB's image service often returns WEBP/AVIF when the request advertises
+    support for those formats. Streamlit can display them, but ReportLab may not
+    draw them into the PDF on every Mac/Python install. To make auto-headshots
+    dependable, convert anything Pillow can open into PNG bytes.
     """
+    if not data or len(data) < 500:
+        return None
+    # JPEG / PNG are already safe for ReportLab.
+    if data.startswith(b"\xff\xd8") or data.startswith(b"\x89PNG"):
+        return data
+    try:
+        from PIL import Image
+        from io import BytesIO
+        img = Image.open(BytesIO(data))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA")
+        out = BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def _download_image_bytes(url: str, headers: Dict[str, str], timeout: int = 12) -> Optional[bytes]:
+    """Download, validate, and normalize an image URL for PDF rendering.
+
+    Uses requests first because it handles TLS/certificates more reliably on
+    many Macs than urllib. Falls back to urllib if requests is unavailable.
+    Also records a short diagnostic trail so the app can show whether the
+    headshot URL was reached, blocked, or returned a non-image response.
+    """
+    global HEADSHOT_DEBUG
+
+    def _ok(data: bytes, content_type: str) -> Optional[bytes]:
+        content_type = (content_type or "").lower()
+        if not data:
+            return None
+        is_image = (
+            "image" in content_type
+            or data.startswith(b"\x89PNG")
+            or data.startswith(b"\xff\xd8")
+            or data[:4] == b"RIFF"
+        )
+        if not is_image:
+            return None
+        return _normalize_image_bytes_for_reportlab(data)
+
+    try:
+        import requests
+        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        HEADSHOT_DEBUG.append(f"{r.status_code} {r.headers.get('content-type','')} {url}")
+        if r.status_code == 200:
+            normalized = _ok(r.content, r.headers.get("Content-Type", ""))
+            if normalized:
+                return normalized
+    except Exception as exc:
+        HEADSHOT_DEBUG.append(f"requests error: {type(exc).__name__}: {url}")
+
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            data = resp.read()
+            HEADSHOT_DEBUG.append(f"urllib {getattr(resp, 'status', '')} {content_type} {url}")
+        return _ok(data, content_type)
+    except Exception as exc:
+        HEADSHOT_DEBUG.append(f"urllib error: {type(exc).__name__}: {url}")
+        return None
+
+
+def get_auto_headshot_bytes(id_keys, name_candidates=None) -> Optional[bytes]:
+    """Fetch a player headshot using playerId and the MiLB/MLB player page.
+
+    Best-effort order:
+    1) Open the MiLB player page built as firstname-lastname-playerid, e.g.
+       https://www.milb.com/es/player/jacob-degrom-594798, then parse its
+       og:image / twitter:image / embedded headshot URLs.
+    2) Fall back to public MLB image-service URLs that MiLB pages commonly use.
+
+    If MiLB/MLB blocks the request or there is no photo, return None so the app
+    still generates the report and the user can upload a photo manually.
+    """
+    import html
     import urllib.request
 
     clean_ids = []
@@ -104,46 +200,131 @@ def get_auto_headshot_bytes(id_keys) -> Optional[bytes]:
         if pid.isdigit() and 4 <= len(pid) <= 10 and pid not in clean_ids:
             clean_ids.append(pid)
 
+    clean_names = []
+    for raw in name_candidates or []:
+        name = str(raw or "").strip()
+        slug = slugify_player_name_for_milb(name)
+        if slug and slug not in clean_names and slug not in {"playerid", "splitby", "nan", "none"}:
+            clean_names.append(slug)
+
     if not clean_ids:
         return None
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome Safari",
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    html_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+    }
+    image_headers = {
+        "User-Agent": html_headers["User-Agent"],
+        # Do NOT advertise AVIF/WEBP. Those can download successfully but fail
+        # when ReportLab tries to place them in the PDF. Prefer PNG/JPEG.
+        "Accept": "image/png,image/jpeg,image/apng,image/*;q=0.8,*/*;q=0.5",
+        "Referer": "https://www.milb.com/",
     }
 
-    # Public MLB image endpoints. MiLB.com player pages generally reference the
-    # same MLBAM playerId image service. Try several sizes/formats because the
-    # CDN can vary by environment.
+    # 1) Try the MiLB/MLB page URL the user described and scrape the image URL.
+    for pid in clean_ids:
+        page_urls = []
+        for slug in clean_names:
+            page_urls.extend([
+                f"https://www.milb.com/es/player/{slug}-{pid}",
+                f"https://www.milb.com/player/{slug}-{pid}",
+                f"https://www.mlb.com/player/{slug}-{pid}",
+            ])
+        for page_url in page_urls:
+            try:
+                req = urllib.request.Request(page_url, headers=html_headers)
+                with urllib.request.urlopen(req, timeout=7) as resp:
+                    page = resp.read().decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            # Pull likely image URLs from meta tags or embedded JSON.
+            candidates = []
+            patterns = [
+                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+                r'<img[^>]+src=["\']([^"\']*(?:headshot|people)[^"\']*)["\']',
+                r'<source[^>]+srcset=["\']([^"\']*(?:headshot|people)[^"\']*)["\']',
+                r'"(?:headshot|image|imageUrl|photoUrl)"\s*:\s*"([^"]+)"',
+                r'(https?:\\/\\/[^" <]+(?:headshot|people)[^" <]+)',
+                r'(https?://[^"\'<\s]+(?:headshot|people)[^"\'<\s]+)',
+            ]
+            for pat in patterns:
+                for match in re.findall(pat, page, flags=re.IGNORECASE):
+                    raw_match = html.unescape(match).replace("\\/", "/")
+                    # srcset values can contain multiple URLs separated by commas.
+                    for piece in re.split(r",\s*", raw_match):
+                        url = piece.strip().split(" ")[0]
+                        if not url:
+                            continue
+                        if url.startswith("//"):
+                            url = "https:" + url
+                        elif url.startswith("/"):
+                            url = "https://www.milb.com" + url
+                        # Avoid tiny 1x transparent/data images.
+                        if url.startswith("http") and "headshot" in url.lower() and url not in candidates:
+                            candidates.append(url)
+
+            # Prefer URLs that include this playerId or headshot/current.
+            candidates = sorted(
+                candidates,
+                key=lambda u: (str(pid) not in u, "headshot" not in u.lower(), len(u)),
+            )
+            for image_url in candidates[:10]:
+                data = _download_image_bytes(image_url, image_headers)
+                if data:
+                    return data
+
+    # 2) Fallback: public MLB/MiLB image endpoints. Try several sizes/transforms.
+    # The img.mlbstatic Cloudinary route is the same image family used on
+    # MiLB player pages. The d_people... transform means the request returns a
+    # valid generic placeholder if a true headshot is unavailable, so we try
+    # non-placeholder style URLs first and the Cloudinary fallback last.
     url_templates = [
+        # Direct image route from MiLB player pages. Try both no-transform and transformed versions.
+        "https://img.mlbstatic.com/mlb-photos/image/upload/v1/people/{pid}/headshot/milb/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/w_360/v1/people/{pid}/headshot/milb/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/w_180/v1/people/{pid}/headshot/milb/current",
+        # MiLB player pages currently expose this exact route. Note the encoded comma.
+        # Example from Jacob deGrom's MiLB page:
+        # https://img.mlbstatic.com/mlb-photos/image/upload/c_fill%2Cg_auto/w_180/v1/people/594798/headshot/milb/current
+        "https://img.mlbstatic.com/mlb-photos/image/upload/c_fill%2Cg_auto/w_360/v1/people/{pid}/headshot/milb/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/c_fill%2Cg_auto/w_240/v1/people/{pid}/headshot/milb/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/c_fill%2Cg_auto/w_180/v1/people/{pid}/headshot/milb/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/c_fill,g_auto/w_360/v1/people/{pid}/headshot/milb/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/c_fill,g_auto/w_240/v1/people/{pid}/headshot/milb/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/c_fill,g_auto/w_180/v1/people/{pid}/headshot/milb/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/f_png,c_fill,g_auto,w_360/v1/people/{pid}/headshot/milb/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/f_png,c_fill,g_auto,w_240/v1/people/{pid}/headshot/milb/current",
+        # Force PNG output from Cloudinary next so ReportLab can draw it.
+        "https://img.mlbstatic.com/mlb-photos/image/upload/f_png,w_720,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/f_png,w_360,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/f_png,w_240,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/f_jpg,w_720,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/f_jpg,w_360,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/w_720,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/w_360,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/w_240,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/w_213,d_people:generic:headshot:67:current.png,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/w_180,d_people:generic:headshot:67:current.png,q_auto:best/v1/people/{pid}/headshot/67/current",
+        "https://img.mlbstatic.com/mlb-photos/image/upload/w_720,q_auto:best/v1/people/{pid}/headshot/current",
         "https://img.mlbstatic.com/mlb-photos/image/upload/w_360,q_auto:best/v1/people/{pid}/headshot/current",
         "https://img.mlbstatic.com/mlb-photos/image/upload/w_240,q_auto:best/v1/people/{pid}/headshot/current",
         "https://img.mlbstatic.com/mlb-photos/image/upload/w_180,q_auto:best/v1/people/{pid}/headshot/current",
-        "https://content.mlb.com/images/headshots/current/60x60/{pid}.png",
+        "https://content.mlb.com/images/headshots/current/240x240/{pid}.png",
         "https://content.mlb.com/images/headshots/current/120x120/{pid}.png",
+        "https://content.mlb.com/images/headshots/current/60x60/{pid}.png",
     ]
 
     for pid in clean_ids:
         for template in url_templates:
-            url = template.format(pid=pid)
-            try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=6) as resp:
-                    content_type = resp.headers.get("Content-Type", "").lower()
-                    data = resp.read()
-                if not data or len(data) < 500:
-                    continue
-                # Basic image signature / content-type validation.
-                is_image = (
-                    "image" in content_type
-                    or data.startswith(b"\x89PNG")
-                    or data.startswith(b"\xff\xd8")
-                    or data[:4] == b"RIFF"
-                )
-                if is_image:
-                    return data
-            except Exception:
-                continue
+            data = _download_image_bytes(template.format(pid=pid), image_headers)
+            if data:
+                return data
 
     return None
 
@@ -870,16 +1051,24 @@ def make_pdf_report(
         yy = y
         line_txt = ""
         lead = leading or size + 4
+        def _draw_line(line_value, yy_value):
+            if align == "center":
+                c.drawCentredString(x, yy_value, line_value)
+            elif align == "right":
+                c.drawRightString(x, yy_value, line_value)
+            else:
+                c.drawString(x, yy_value, line_value)
+
         for word in words:
             test = (line_txt + " " + word).strip()
             if c.stringWidth(test, font, size) <= maxw or not line_txt:
                 line_txt = test
             else:
-                c.drawString(x, yy, line_txt)
+                _draw_line(line_txt, yy)
                 yy -= lead
                 line_txt = word
         if line_txt:
-            c.drawString(x, yy, line_txt)
+            _draw_line(line_txt, yy)
             yy -= lead
         return yy
 
@@ -925,7 +1114,7 @@ def make_pdf_report(
         c.setFillColor(header_color)
         xx = x
         for i, h in enumerate(headers):
-            c.drawString(xx, y_top-row_h+11, safe(h).upper())
+            c.drawCentredString(xx + colw[i]/2, y_top-row_h+11, safe(h).upper())
             xx += colw[i]
         c.setStrokeColor(line2)
         c.setLineWidth(0.8)
@@ -941,7 +1130,14 @@ def make_pdf_report(
                     c.setFillColor(blue); c.setFont("Helvetica-Bold", fs)
                 else:
                     c.setFillColor(textc); c.setFont("Helvetica", fs)
-                c.drawString(xx, yy+11, shorten(val, 32))
+                cell_txt = shorten(val, 32)
+                # Keep names/labels readable on the left, but center all numeric columns
+                # so the table feels much closer to the clean dashboard mockup.
+                h_label = safe(headers[i]).lower() if i < len(headers) else ""
+                if h_label in {"pitcher", "metric", "matched pitches"}:
+                    c.drawString(xx+4, yy+11, cell_txt)
+                else:
+                    c.drawCentredString(xx + colw[i]/2, yy+11, cell_txt)
                 xx += colw[i]
             c.setStrokeColor(line2); c.line(x, yy, x+w, yy)
             yy -= row_h
@@ -955,7 +1151,7 @@ def make_pdf_report(
         c.setFont("Helvetica-Bold", fs); c.setFillColor(colors.white)
         xx = x
         for i, h in enumerate(headers):
-            c.drawString(xx+8, y_top-row_h+10, safe(h))
+            c.drawCentredString(xx + colw[i]/2, y_top-row_h+10, safe(h))
             xx += colw[i]
         yy = y_top - row_h
         for r_i, row in enumerate(rows):
@@ -968,7 +1164,12 @@ def make_pdf_report(
                     c.setFillColor(blue); c.setFont("Helvetica-Bold", fs+0.5)
                 else:
                     c.setFillColor(textc); c.setFont("Helvetica", fs)
-                c.drawString(xx+8, yy+10, shorten(val, 30))
+                cell_txt = shorten(val, 30)
+                h_label = safe(headers[i]).lower() if i < len(headers) else ""
+                if h_label in {"pitcher", "metric"}:
+                    c.drawString(xx+8, yy+10, cell_txt)
+                else:
+                    c.drawCentredString(xx + colw[i]/2, yy+10, cell_txt)
                 xx += colw[i]
             c.setStrokeColor(line2); c.line(x, yy, x+w, yy)
         c.setStrokeColor(line); c.rect(x, yy, w, row_h*(len(rows)+1), fill=0, stroke=1)
@@ -1085,52 +1286,179 @@ def make_pdf_report(
         except Exception:
             return None
 
-    def percentiles():
-        rows=[]
-        aliases=[("Velocity","Vel",["Vel"]),("Spin Rate","Spin",["Spin"]),("Extension","Extension",["Extension"]),("IVB","IndVertBrk",["IndVertBrk","IVB"]),("HB","HorzBrk",["HorzBrk","HB"]),("Release Height","Rel. Height",["Rel. Height","RelHt"]),("Release Side","RSd",["RSd"])]
-        for label,std,names in aliases:
-            tc=metric_col(target_agg,names); cc=metric_col(comp_agg,names)
-            if not tc or not cc: continue
-            vals=[]; target_vals=[]
-            for _,tr in target_agg.iterrows():
-                pitch=tr.get(target_pitch_col)
-                tv=num(tr.get(tc))
-                pool=pd.to_numeric(comp_agg.loc[comp_agg[comp_pitch_col].astype(str).str.lower()==str(pitch).lower(), cc], errors='coerce').dropna()
-                if pd.isna(tv) or pool.empty: continue
-                vals.append(float((pool <= tv).mean()*100)); target_vals.append(tv)
-            if vals:
-                unit = " mph" if label == "Velocity" else (" rpm" if label == "Spin Rate" else (" ft" if label in {"Extension","Release Height","Release Side"} else " in"))
-                rows.append((label, round(float(np.mean(vals))), fmt(np.mean(target_vals),1) + unit))
-        return rows[:7]
+    def pitch_percentiles():
+        """Return percentile rows separated by pitch type.
+
+        Each target pitch is compared only against the comparison pool for that same pitch type.
+        This prevents a single combined percentile card where fastball velocity, slider shape,
+        etc. are blended together.
+        """
+        aliases=[
+            ("Velocity","Vel",["Vel"]),
+            ("Spin","Spin",["Spin"]),
+            ("Extension","Extension",["Extension"]),
+            ("IVB","IndVertBrk",["IndVertBrk","IVB"]),
+            ("HB","HorzBrk",["HorzBrk","HB"]),
+            ("Rel Height","Rel. Height",["Rel. Height","RelHt"]),
+            ("Rel Side","RSd",["RSd"]),
+        ]
+        out=[]
+        # Prefer pitch types that actually appear in the similarity results so the card mirrors the report.
+        pitch_list=[p for p in PITCH_ORDER if p in pitch_results and pitch_results.get(p) is not None and not pitch_results.get(p).empty]
+        if not pitch_list:
+            pitch_list=[]
+            if target_pitch_col in target_agg.columns:
+                for p in target_agg[target_pitch_col].dropna().astype(str).tolist():
+                    canon=canonical_pitch_for_reports(p) or p
+                    if canon not in pitch_list:
+                        pitch_list.append(canon)
+        for pch in pitch_list:
+            tr = target_agg[target_agg[target_pitch_col].astype(str).str.lower()==str(pch).lower()]
+            pool = comp_agg[comp_agg[comp_pitch_col].astype(str).str.lower()==str(pch).lower()] if comp_pitch_col in comp_agg.columns else comp_agg
+            if tr.empty or pool.empty:
+                continue
+            trow=tr.iloc[0]
+            rows=[]
+            for label,std,names in aliases:
+                tc=metric_col(target_agg,names); cc=metric_col(pool,names)
+                if not tc or not cc:
+                    continue
+                tv=num(trow.get(tc))
+                pv=pd.to_numeric(pool[cc], errors='coerce').dropna()
+                if pd.isna(tv) or pv.empty:
+                    continue
+                pct=float((pv <= tv).mean()*100)
+                unit = " mph" if label == "Velocity" else (" rpm" if label == "Spin" else (" ft" if label in {"Extension","Rel Height","Rel Side"} else " in"))
+                rows.append((label, max(0,min(100,round(pct))), fmt(tv,1)+unit))
+            if rows:
+                out.append((pch, rows[:5]))
+        return out
+
+    def ordinal(n):
+        try:
+            n=int(round(float(n)))
+        except Exception:
+            return ""
+        if 10 <= n % 100 <= 20:
+            suffix="th"
+        else:
+            suffix={1:"st",2:"nd",3:"rd"}.get(n%10,"th")
+        return f"{n}{suffix}"
 
     def reason_lines():
-        defaults = ["Similar fastball velocity (+0.3 mph)", "Similar fastball IVB (+0.4\")", "Similar slider shape (HB & IVB)", "Comparable release height", "Similar overall pitch mix and shapes"]
-        try:
-            raw = build_why_this_comp(target_agg, {p:r for p,r in pitch_results.items() if r is not None and not r.empty}, target_pitch_col, metrics, comp_pitcher_col)
-        except Exception:
-            raw = []
-        out=[]
-        for r in raw:
-            s=safe(r).replace("—", "— ")
-            if s:
-                out.append(s)
-        return (out + defaults)[:5]
+        """Explain the selected pitcher vs the OVERALL top comp only.
+
+        Earlier versions pulled the best per-pitch comp, which made this section
+        mention pitchers other than the Top Comp. This version finds the Top Comp
+        pitcher inside the comparison aggregate and compares the same pitch types
+        directly against the selected pitcher.
+        """
+        if not top_name:
+            return []
+        metric_defs = [
+            ("Vel", ["Vel"], "velocity", " mph"),
+            ("VelMax", ["VelMax"], "max velo", " mph"),
+            ("Spin", ["Spin"], "spin", " rpm"),
+            ("Extension", ["Extension"], "extension", " ft"),
+            ("IVB", ["IndVertBrk", "IVB"], "IVB", '"'),
+            ("HB", ["HorzBrk", "HB"], "HB", '"'),
+            ("RelHt", ["Rel. Height", "RelHt"], "release height", " ft"),
+            ("RSd", ["RSd"], "release side", " ft"),
+        ]
+        # Use the matched pitches reported in the overall leaderboard when available.
+        top_pitch_list = []
+        for raw in safe(top_pitches).replace("…", "").split(','):
+            cp = canonical_pitch_for_reports(raw.strip())
+            if cp and cp not in top_pitch_list:
+                top_pitch_list.append(cp)
+        if not top_pitch_list:
+            top_pitch_list = [p for p in PITCH_ORDER if p in pitch_results and pitch_results.get(p) is not None and not pitch_results.get(p).empty]
+
+        out = []
+        for pch in top_pitch_list[:4]:
+            tr = target_agg[target_agg[target_pitch_col].astype(str).str.lower() == str(pch).lower()]
+            cr = comp_agg[
+                (comp_agg[comp_pitch_col].astype(str).str.lower() == str(pch).lower()) &
+                (comp_agg[comp_pitcher_col].astype(str).str.lower() == str(top_name).lower())
+            ]
+            if tr.empty or cr.empty:
+                continue
+            trow = tr.iloc[0]
+            crow = cr.iloc[0]
+            diffs = []
+            for _, aliases, label, unit in metric_defs:
+                tc = metric_col(target_agg, aliases)
+                cc = metric_col(comp_agg, aliases)
+                if not tc or not cc:
+                    continue
+                tv = num(trow.get(tc))
+                cv = num(crow.get(cc))
+                if pd.isna(tv) or pd.isna(cv):
+                    continue
+                gap = abs(float(tv) - float(cv))
+                # Spin gaps read too large next to shape/slot gaps; still allow if it is best.
+                diffs.append((gap, label, unit))
+            if diffs:
+                diffs.sort(key=lambda x: x[0])
+                best = diffs[:2]
+                parts = []
+                for gap, label, unit in best:
+                    if unit == " rpm":
+                        parts.append(f"{label} gap {gap:.0f}{unit}")
+                    else:
+                        parts.append(f"{label} gap {gap:.1f}{unit}")
+                out.append(f"{pch}: {top_name} — " + "; ".join(parts))
+        if out:
+            return out[:4]
+        return [f"Closest overall match: {top_name}", f"Matched pitch types: {safe(top_pitches) or 'available arsenal'}"]
 
     def draw_percentile_card(x,y,w,h):
-        card(x,y,w,h,"Percentile rankings", "(vs Comparison Pool)")
-        rows=percentiles(); yy=y+h-78
-        draw_text(x+18, yy+36, "METRIC", 8, muted, True)
-        draw_text(x+140, yy+36, "VALUE", 8, muted, True)
-        for lab,pct,val in rows:
-            draw_text(x+18, yy, lab, 11, textc)
-            draw_text(x+140, yy, val, 10.5, textc)
-            bx=x+260; bw=w-348
-            c.setFillColor(line2); c.roundRect(bx, yy-2, bw, 8, 4, fill=1, stroke=0)
-            c.setFillColor(blue); c.roundRect(bx, yy-2, bw*max(0,min(100,pct))/100, 8, 4, fill=1, stroke=0)
-            suffix = "nd" if int(pct)%10 == 2 and int(pct) not in [12] else ("rd" if int(pct)%10 == 3 and int(pct) not in [13] else ("st" if int(pct)%10 == 1 and int(pct) not in [11] else "th"))
-            draw_text(x+w-28, yy-1, f"{int(pct)}{suffix}", 10, textc, align="right")
-            yy -= 30
-        draw_text(x+18, y+28, "Percentiles calculated from all pitchers in the comparison dataset.", 9, muted, maxw=w-36)
+        card(x,y,w,h,"Pitch percentile rankings", "(vs Same Pitch Type)")
+        groups = pitch_percentiles()
+        if not groups:
+            draw_text(x+18, y+h/2, "No percentile data available.", 12, muted, maxw=w-36)
+            return
+
+        # Wide percentile card: colored pitch headers, centered pitch names, and no bars.
+        # Use fixed sub-columns inside each pitch group so the value and percentile never bleed
+        # into the neighboring pitch group. This was the main cause of the crowded look.
+        n = min(len(groups), 4)
+        gap = 22
+        left_pad = 18
+        right_pad = 18
+        col_w = (w - left_pad - right_pad - gap*(n-1)) / n
+        base_x = x + left_pad
+        top_y = y + h - 58
+        row_h = 26
+        for idx, (pch, rows) in enumerate(groups[:n]):
+            px0 = base_x + idx*(col_w+gap)
+            col = C(pitch_colors.get(pch,"#9ca3af"),"#9ca3af")
+
+            # Pitch header bar: centered label with a little breathing room on each side.
+            c.setFillColor(col)
+            c.roundRect(px0, top_y-10, col_w, 28, 5, fill=1, stroke=0)
+            draw_text(px0 + col_w/2, top_y, pch.upper(), 10.2, colors.white, True, align="center", maxw=col_w-14)
+
+            metric_x = px0 + 8
+            # Keep the percentile tucked inside its pitch card, not riding the edge.
+            pct_x = px0 + col_w - 14
+            # Put value safely between the metric and percentile columns.
+            value_x = px0 + col_w * 0.52
+            value_max = max(38, col_w * 0.25)
+            yy = top_y - 32
+            for ridx, (lab,pct,val) in enumerate(rows[:5]):
+                if ridx % 2 == 1:
+                    c.setFillColor(colors.HexColor("#fbfdff"))
+                    c.rect(px0, yy-5, col_w, row_h, fill=1, stroke=0)
+
+                # Smaller, tighter typography in this card so four pitches can fit cleanly.
+                draw_text(metric_x, yy+4, lab, 7.4, textc, maxw=col_w*0.32)
+                draw_text(value_x, yy+4, val, 7.3, navy, align="center", maxw=value_max)
+                draw_text(pct_x, yy+4, ordinal(pct), 7.8, blue, True, align="right")
+
+                c.setStrokeColor(line2); c.setLineWidth(.35); c.line(px0+3, yy-7, px0+col_w-3, yy-7)
+                yy -= row_h
+        draw_text(x+18, y+18, "Each pitch is ranked against only pitchers with that same pitch type in the comparison pool.", 7.4, muted, maxw=w-36)
 
     # --- Data -----------------------------------------------------------------
     bio = target_bio or {}
@@ -1173,10 +1501,10 @@ def make_pdf_report(
     detail_x = px + (62 if logo_bytes else 0)
     detail_y = 806
     details = [
-        ("ORG", safe(bio.get("Org", "TEX"), "TEX"), 62),
+        ("ORG", safe(bio.get("Org", "TEX"), "TEX").upper(), 62),
         ("TEAM", safe(bio.get("Team", ""), "—"), 172),
-        ("LEVEL", safe(bio.get("Level", ""), "—"), 64),
-        ("THROWS", safe(bio.get("Throws", ""), "—"), 70),
+        ("LEVEL", safe(bio.get("Level", ""), "—").upper(), 64),
+        ("THROWS", safe(bio.get("Throws", ""), "—").upper(), 70),
     ]
     if age_val:
         details.append(("AGE", age_val, 54))
@@ -1286,9 +1614,10 @@ def make_pdf_report(
         for i,(_,r) in enumerate(overall.head(5).iterrows(),1):
             sc=r.get("Similarity Score",r.get("Avg_Similarity",np.nan))
             o_rows.append([i,shorten(r.get(comp_pitcher_col,r.get("Pitcher","")),22),fmt(sc,1),shorten(r.get("Matched_Pitches",""),18)])
-    draw_table_lines(46, 666, 382, ["Rank","Pitcher","Similarity","Matched Pitches"], o_rows, [.14,.42,.22,.22], row_h=42, fs=12, header_fs=9, blue_col=2)
+    draw_table_lines(46, 666, 382, ["Rank","Pitcher","Similarity","Matched Pitches"], o_rows, [.14,.42,.22,.22], row_h=42, fs=12, header_fs=9, header_fill=navy, blue_col=2)
 
-    card(472, 405, 508, 315, "Movement plot", "(IVB vs HB)")
+    # Narrower movement card so pitch percentile rankings have more room, matching the dashboard mockup.
+    card(458, 405, 280, 315, "Movement plot", "(IVB vs HB)")
 
     def draw_native_movement(x, y, w, h):
         hx_t = metric_col(target_agg, ["HorzBrk","HB","HorizontalBreak","Horz Break","Horizontal Break"])
@@ -1352,54 +1681,63 @@ def make_pdf_report(
         draw_text(x-35, y+h/2, "IVB", 9, navy)
         return True
 
-    if draw_native_movement(548, 480, 330, 170):
-        draw_text(486, 430, "Plot shows average movement. More toward top = more rise. More to right = more arm-side run.", 9, muted, maxw=460)
+    if draw_native_movement(492, 484, 200, 166):
+        draw_text(474, 430, "Plot shows average movement. More toward top = more rise. More right = more arm-side run.", 7.1, muted, maxw=250)
     else:
-        draw_text(726, 560, "Needs HB/IVB movement columns.", 12, muted, align="center")
+        draw_text(598, 560, "Needs HB/IVB movement columns.", 12, muted, align="center")
 
-    draw_percentile_card(1000, 405, 508, 315)
+    draw_percentile_card(752, 405, 756, 315)
 
     # --- Bottom pitch cards ---------------------------------------------------
+    # Keep EVERYTHING on one polished page: up to four pitch cards fit across
+    # the bottom row. Each card includes top comps + compact metric comparison.
     matched={p:r for p,r in pitch_results.items() if r is not None and not r.empty}
-    shown=[p for p in PITCH_ORDER if p in matched][:2]
-    bottom_y=92; bottom_h=268; card_w=720
+    shown=[p for p in PITCH_ORDER if p in matched][:4]
+    bottom_y=88; bottom_h=280
+    gap=14
+    card_w=(W-56-gap*(max(1,len(shown))-1))/max(1,len(shown)) if shown else 0
+    if card_w > 360:
+        card_w = 360
     for idx,pch in enumerate(shown):
-        x=28+idx*(card_w+24)
+        x=28+idx*(card_w+gap)
         card(x,bottom_y,card_w,bottom_h,None)
         col=C(pitch_colors.get(pch,accent_color),accent_color)
-        c.setFillColor(col); c.circle(x+28,bottom_y+bottom_h-30,12,fill=1,stroke=0)
-        draw_text(x+48,bottom_y+bottom_h-36,f"{pch.upper()} SIMILARITY",15,navy,True)
-        # left: top five
-        left_x=x+24
-        draw_text(left_x,bottom_y+bottom_h-64,f"TOP 5 MOST SIMILAR ({pch.upper()})",11,navy,True)
+        c.setFillColor(col); c.circle(x+22,bottom_y+bottom_h-28,10,fill=1,stroke=0)
+        draw_text(x+40,bottom_y+bottom_h-34,f"{pch.upper()} SIMILARITY",13,navy,True, maxw=card_w-50)
         res=matched[pch]
+        tr=target_agg[target_agg[target_pitch_col].astype(str).str.lower()==str(pch).lower()]
+        comp_name = safe(res.iloc[0].get(comp_pitcher_col,"Comp")) if not res.empty else "Comp"
+
+        # Left mini-table: top 5 comps
+        left_x=x+16
+        left_w=card_w*0.43
+        right_x=x+left_w+30
+        right_w=card_w-left_w-46
+        draw_text(left_x,bottom_y+bottom_h-58,f"TOP 5 MOST SIMILAR",9.2,navy,True, maxw=left_w)
         rows=[]
         for i,(_,r) in enumerate(res.head(5).iterrows(),1):
-            rows.append([i,shorten(r.get(comp_pitcher_col,""),22),fmt(r.get("Similarity Score"),1)])
-        draw_table_lines(left_x,bottom_y+bottom_h-88,280,["Rank","Pitcher","Similarity"],rows,[.16,.58,.26],row_h=30,fs=10.5,header_fs=8,blue_col=2)
-        # separator
-        c.setStrokeColor(line); c.setLineWidth(1.0); c.line(x+320,bottom_y+35,x+320,bottom_y+bottom_h-62)
-        # right: metrics
-        right_x=x+344
-        comp_name = safe(res.iloc[0].get(comp_pitcher_col,"Comp")) if not res.empty else "Comp"
-        draw_text(right_x,bottom_y+bottom_h-64,f"METRIC COMPARISON ({pch.upper()})",11,navy,True)
-        tr=target_agg[target_agg[target_pitch_col].astype(str).str.lower()==str(pch).lower()]
+            rows.append([i,shorten(r.get(comp_pitcher_col,""),16),fmt(r.get("Similarity Score"),1)])
+        draw_table_lines(left_x,bottom_y+bottom_h-78,left_w,["#","Pitcher","Sim"],rows,[.16,.58,.26],row_h=27,fs=8.5,header_fs=7.2,header_fill=col,blue_col=2)
+
+        # Divider
+        c.setStrokeColor(line); c.setLineWidth(.8); c.line(right_x-12,bottom_y+28,right_x-12,bottom_y+bottom_h-62)
+
+        # Right mini-table: metric comparison
+        draw_text(right_x,bottom_y+bottom_h-58,f"METRIC COMPARISON",9.2,navy,True, maxw=right_w)
         if not tr.empty and not res.empty:
             trow=tr.iloc[0]; crow=res.iloc[0]
-            metric_names=[]
-            preferred=[("Vel","Velocity"),("VelMax","VelMax"),("Spin","Spin Rate"),("Extension","Extension"),("IndVertBrk","IVB"),("HorzBrk","HB"),("Rel. Height","Release Height"),("RSd","Release Side")]
-            for cand,label in preferred:
-                if cand in trow.index and cand in crow.index:
-                    metric_names.append((cand,label))
+            preferred=[("Vel","Velo"),("VelMax","Max"),("Spin","Spin"),("Extension","Ext"),("IndVertBrk","IVB"),("HorzBrk","HB"),("Rel. Height","RelHt")]
             mrows=[]
-            for m,label in metric_names[:7]:
-                tv=num(trow.get(m)); cv=num(crow.get(m))
-                diff="" if pd.isna(tv) or pd.isna(cv) else f"{tv-cv:+.1f}"
-                mrows.append([label,fmt(tv,1),fmt(cv,1),diff])
-            draw_table_lines(right_x,bottom_y+bottom_h-88,330,["Metric","Target",f"Comp ({shorten(comp_name,13)})","Diff"],mrows,[.34,.18,.30,.18],row_h=23,fs=9.2,header_fs=7.5,blue_col=None)
+            for m,label in preferred:
+                if m in trow.index and m in crow.index:
+                    tv=num(trow.get(m)); cv=num(crow.get(m))
+                    diff="" if pd.isna(tv) or pd.isna(cv) else f"{tv-cv:+.1f}"
+                    mrows.append([label,fmt(tv,1),fmt(cv,1),diff])
+            draw_table_lines(right_x,bottom_y+bottom_h-78,right_w,["Metric","Tgt","Comp","Diff"],mrows[:7],[.33,.21,.24,.22],row_h=22,fs=7.2,header_fs=6.5,header_fill=col,blue_col=None)
 
     draw_text(26, 48, "Method: pitch types with no matches are excluded. Metrics are averaged by pitcher/pitch type, standardized by comparison pool, and ranked by normalized distance.", 8.5, muted)
     draw_text(26, 30, "Similarity = 100 / (1 + distance).", 8.5, muted)
+
     c.save(); buf.seek(0); return buf.getvalue()
 
 st.write("Upload one target-pitcher CSV and one or more comparison CSVs. The app compares pitch characteristics by pitch type and returns the closest matches.")
@@ -1414,6 +1752,7 @@ with st.sidebar:
     min_pitch_count = st.selectbox("Minimum pitches thrown", [1, 20, 50, 100], index=0)
     logo_file = st.file_uploader("Optional team logo for reports", type=["png", "jpg", "jpeg"], key="logo")
     headshot_file = st.file_uploader("Optional pitcher headshot", type=["png", "jpg", "jpeg"], key="headshot")
+    headshot_url_input = st.text_input("Optional headshot URL", value="", help="Paste a MiLB/MLB image URL if auto-fetch is blocked on your network.")
     auto_headshot = st.checkbox("Try MiLB/MLB headshot from playerId", value=True)
     st.markdown("**Report style**")
     report_primary_color = st.color_picker("Primary report color", "#0b1f3a")
@@ -1729,24 +2068,55 @@ for col in possible_id_columns(list(target_use.columns)):
 target_id_values.add(str(selected_target_name))
 target_id_keys = {normalize_identifier(v) for v in target_id_values if normalize_identifier(v)}
 
-headshot_bytes = headshot_file.getvalue() if headshot_file is not None else None
-if headshot_bytes is None and auto_headshot and target_id_keys:
-    with st.spinner("Trying to fetch pitcher headshot from MLB/MiLB player image service..."):
-        headshot_bytes = get_auto_headshot_bytes(target_id_keys)
-    if headshot_bytes:
-        st.caption("Headshot detected from playerId and will be used in the report.")
-
 # Report header name: use target CSV full name when present; otherwise use
-# comparison CSV playerFullName matched by playerId. The text input is there as
-# a safety valve for exports that only include IDs.
-target_display_name = get_target_display_name(
+# comparison CSV playerFullName matched by playerId. This is also used to build
+# the MiLB page URL for automatic headshot lookup.
+target_display_guess = get_target_display_name(
     target_use,
     selected_target_name,
     target_pitcher_col,
     comp_df_for_lookup=comp_use,
     target_id_keys_for_lookup=target_id_keys,
 )
-target_display_name = st.text_input("Report pitcher name", value=target_display_name).strip() or "Target Pitcher"
+
+headshot_name_candidates = [target_display_guess, selected_target_name]
+for col in possible_name_columns(list(target_use.columns)):
+    if col in target_use.columns:
+        headshot_name_candidates.extend(target_use[col].dropna().astype(str).head(5).tolist())
+
+headshot_bytes = headshot_file.getvalue() if headshot_file is not None else None
+if headshot_bytes is None and str(headshot_url_input or "").strip():
+    HEADSHOT_DEBUG.clear()
+    headshot_bytes = _download_image_bytes(
+        str(headshot_url_input).strip(),
+        {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept": "image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5",
+            "Referer": "https://www.milb.com/",
+        },
+    )
+    if headshot_bytes:
+        st.caption("Headshot loaded from the URL you entered.")
+    else:
+        st.warning("Could not load that headshot URL. Try opening it in your browser first, then paste the final image URL.")
+if headshot_bytes is None and auto_headshot and target_id_keys:
+    HEADSHOT_DEBUG.clear()
+    with st.spinner("Trying to fetch pitcher headshot from MiLB player page / MLB image service..."):
+        headshot_bytes = get_auto_headshot_bytes(target_id_keys, headshot_name_candidates)
+    if headshot_bytes:
+        st.caption("Headshot detected from the player page/playerId and will be used in the report.")
+    else:
+        st.caption("No auto headshot found. Your network may be blocking mlbstatic.com image downloads, or the player may not have a public headshot.")
+        if target_id_keys:
+            sample_id = sorted(target_id_keys)[0]
+            st.code(f"https://img.mlbstatic.com/mlb-photos/image/upload/c_fill%2Cg_auto/w_180/v1/people/{sample_id}/headshot/milb/current")
+        with st.expander("Headshot fetch diagnostics"):
+            st.write("Player IDs tried:", sorted(target_id_keys))
+            st.write("Name slugs tried:", [slugify_player_name_for_milb(x) for x in headshot_name_candidates if str(x).strip()][:5])
+            st.write("Attempts:")
+            st.code("\n".join(HEADSHOT_DEBUG[-20:]) or "No attempts recorded")
+
+target_display_name = st.text_input("Report pitcher name", value=target_display_guess).strip() or "Target Pitcher"
 st.caption(f"PDF header will use: {target_display_name}")
 target_bio = lookup_target_bio(target_display_name, comp_use, target_id_keys)
 # If age/hand/position are not in the CSVs, try the public MLB Stats API using playerId.
@@ -1760,6 +2130,14 @@ except Exception:
 report_age_value = st.text_input("Report age (optional)", value=target_bio.get("Age", "")).strip()
 if report_age_value:
     target_bio["Age"] = report_age_value
+
+# Display polish: keep short bio values in report-style uppercase.
+# This turns values like mlb/rok/dsl/r into MLB/ROK/DSL/R while leaving the team
+# name in normal title case.
+for _bio_key in ["Org", "Level", "Throws"]:
+    if str(target_bio.get(_bio_key, "")).strip():
+        target_bio[_bio_key] = str(target_bio[_bio_key]).strip().upper()
+
 if target_bio:
     st.caption("Report player info detected: " + " • ".join([f"{k}: {v}" for k, v in target_bio.items()]))
 
