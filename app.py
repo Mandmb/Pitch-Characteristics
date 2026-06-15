@@ -131,7 +131,49 @@ def _normalize_image_bytes_for_reportlab(data: bytes) -> Optional[bytes]:
         return None
 
 
-def _download_image_bytes(url: str, headers: Dict[str, str], timeout: int = 12) -> Optional[bytes]:
+
+
+def _headshot_cache_dir():
+    """Local persistent cache so headshots that work once keep working later.
+
+    MiLB/MLB image services occasionally throttle or return a temporary failure.
+    A local cache makes the report dependable once a player image has been found.
+    """
+    from pathlib import Path
+    d = Path.cwd() / "headshot_cache"
+    try:
+        d.mkdir(exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _headshot_cache_path(pid: str):
+    return _headshot_cache_dir() / f"{pid}.png"
+
+
+def _load_cached_headshot(pid: str) -> Optional[bytes]:
+    try:
+        path = _headshot_cache_path(pid)
+        if path.exists() and path.stat().st_size > 500:
+            data = path.read_bytes()
+            normalized = _normalize_image_bytes_for_reportlab(data)
+            if normalized:
+                return normalized
+    except Exception:
+        return None
+    return None
+
+
+def _save_cached_headshot(pid: str, data: bytes) -> None:
+    try:
+        normalized = _normalize_image_bytes_for_reportlab(data)
+        if normalized:
+            _headshot_cache_path(pid).write_bytes(normalized)
+    except Exception:
+        pass
+
+def _download_image_bytes(url: str, headers: Dict[str, str], timeout: int = 12, attempts: int = 3) -> Optional[bytes]:
     """Download, validate, and normalize an image URL for PDF rendering.
 
     Uses requests first because it handles TLS/certificates more reliably on
@@ -155,28 +197,44 @@ def _download_image_bytes(url: str, headers: Dict[str, str], timeout: int = 12) 
             return None
         return _normalize_image_bytes_for_reportlab(data)
 
+    import time
     try:
         import requests
-        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        HEADSHOT_DEBUG.append(f"{r.status_code} {r.headers.get('content-type','')} {url}")
-        if r.status_code == 200:
-            normalized = _ok(r.content, r.headers.get("Content-Type", ""))
-            if normalized:
-                return normalized
+        session = requests.Session()
+        for i in range(max(1, attempts)):
+            try:
+                r = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                HEADSHOT_DEBUG.append(f"try {i+1}: {r.status_code} {r.headers.get('content-type','')} {url}")
+                if r.status_code == 200:
+                    normalized = _ok(r.content, r.headers.get("Content-Type", ""))
+                    if normalized:
+                        return normalized
+                # retry temporary blocks / throttles
+                if r.status_code in (403, 408, 429, 500, 502, 503, 504):
+                    time.sleep(0.6 + i * 0.5)
+                    continue
+                break
+            except Exception as exc:
+                HEADSHOT_DEBUG.append(f"requests try {i+1} error: {type(exc).__name__}: {url}")
+                time.sleep(0.6 + i * 0.5)
     except Exception as exc:
-        HEADSHOT_DEBUG.append(f"requests error: {type(exc).__name__}: {url}")
+        HEADSHOT_DEBUG.append(f"requests setup error: {type(exc).__name__}: {url}")
 
     import urllib.request
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            data = resp.read()
-            HEADSHOT_DEBUG.append(f"urllib {getattr(resp, 'status', '')} {content_type} {url}")
-        return _ok(data, content_type)
-    except Exception as exc:
-        HEADSHOT_DEBUG.append(f"urllib error: {type(exc).__name__}: {url}")
-        return None
+    for i in range(max(1, attempts)):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                data = resp.read()
+                HEADSHOT_DEBUG.append(f"urllib try {i+1}: {getattr(resp, 'status', '')} {content_type} {url}")
+            normalized = _ok(data, content_type)
+            if normalized:
+                return normalized
+        except Exception as exc:
+            HEADSHOT_DEBUG.append(f"urllib try {i+1} error: {type(exc).__name__}: {url}")
+            time.sleep(0.6 + i * 0.5)
+    return None
 
 
 def get_auto_headshot_bytes(id_keys, name_candidates=None) -> Optional[bytes]:
@@ -209,6 +267,15 @@ def get_auto_headshot_bytes(id_keys, name_candidates=None) -> Optional[bytes]:
 
     if not clean_ids:
         return None
+
+    # 0) Use local cache first. This is the key reliability layer: once a
+    # headshot successfully loads, future exports do not depend on MiLB/MLB
+    # responding perfectly every time.
+    for pid in clean_ids:
+        cached = _load_cached_headshot(pid)
+        if cached:
+            HEADSHOT_DEBUG.append(f"cache hit: {pid}")
+            return cached
 
     html_headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome/124 Safari/537.36",
@@ -275,6 +342,7 @@ def get_auto_headshot_bytes(id_keys, name_candidates=None) -> Optional[bytes]:
             for image_url in candidates[:10]:
                 data = _download_image_bytes(image_url, image_headers)
                 if data:
+                    _save_cached_headshot(str(pid), data)
                     return data
 
     # 2) Fallback: public MLB/MiLB image endpoints. Try several sizes/transforms.
@@ -324,6 +392,7 @@ def get_auto_headshot_bytes(id_keys, name_candidates=None) -> Optional[bytes]:
         for template in url_templates:
             data = _download_image_bytes(template.format(pid=pid), image_headers)
             if data:
+                _save_cached_headshot(str(pid), data)
                 return data
 
     return None
@@ -2113,8 +2182,17 @@ if headshot_bytes is None and auto_headshot and target_id_keys:
         with st.expander("Headshot fetch diagnostics"):
             st.write("Player IDs tried:", sorted(target_id_keys))
             st.write("Name slugs tried:", [slugify_player_name_for_milb(x) for x in headshot_name_candidates if str(x).strip()][:5])
+            st.write("Cache folder:", str(_headshot_cache_dir()))
             st.write("Attempts:")
-            st.code("\n".join(HEADSHOT_DEBUG[-20:]) or "No attempts recorded")
+            st.code("\n".join(HEADSHOT_DEBUG[-35:]) or "No attempts recorded")
+
+# If the user uploads/pastes a headshot, cache it under the playerId so future
+# reports can auto-use it even if the remote service is intermittent.
+if headshot_bytes and target_id_keys:
+    try:
+        _save_cached_headshot(sorted(target_id_keys)[0], headshot_bytes)
+    except Exception:
+        pass
 
 target_display_name = st.text_input("Report pitcher name", value=target_display_guess).strip() or "Target Pitcher"
 st.caption(f"PDF header will use: {target_display_name}")
